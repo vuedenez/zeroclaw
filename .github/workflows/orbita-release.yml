@@ -1,0 +1,215 @@
+# Orbita build of ZeroClaw — see ORBITA-BUILD.md for the contract.
+#
+# Derived from release-stable-manual.yml at upstream tag v0.7.5. Differences:
+#   * trigger / validation accept only `v<X.Y.Z>-orbita.<N>` tags, where
+#     `X.Y.Z` must equal the `version` in Cargo.toml (the upstream base);
+#   * a single target (x86_64-unknown-linux-gnu) — the Orbita deploy hosts
+#     are amd64; the toolchain (1.93.0), runner (ubuntu-22.04, glibc 2.35),
+#     build command and cargo features are byte-identical to upstream's for
+#     this target;
+#   * no web dashboard, desktop, docker, scoop/aur/homebrew, tweet/discord
+#     jobs: the `embedded-web` feature is not part of the release feature
+#     set, so `web/dist` never reaches the binary and is not packaged;
+#   * the tarball carries the binary, the three license files and a build
+#     marker instead of `web/dist`.
+name: Orbita Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+-orbita.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build (e.g. v0.7.5-orbita.0)"
+        required: true
+        type: string
+
+concurrency:
+  group: orbita-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # Same as upstream RELEASE_CARGO_FEATURES; applied on top of default features.
+  RELEASE_CARGO_FEATURES: channel-matrix,channel-lark,whatsapp-web
+  RUST_TOOLCHAIN: "1.93.0"
+  TARGET: x86_64-unknown-linux-gnu
+
+jobs:
+  validate:
+    name: Validate tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      upstream_version: ${{ steps.check.outputs.upstream_version }}
+      orbita_build: ${{ steps.check.outputs.orbita_build }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - name: Validate tag format and Cargo.toml match
+        id: check
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag || '' }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          cargo_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            tag="$REF_NAME"
+          else
+            tag="$INPUT_TAG"
+          fi
+
+          if [[ ! "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)-orbita\.([0-9]+)$ ]]; then
+            echo "::error::Tag must look like v<X.Y.Z>-orbita.<N>. Got: ${tag}"
+            exit 1
+          fi
+          upstream_version="${BASH_REMATCH[1]}"
+          orbita_build="${BASH_REMATCH[2]}"
+
+          if [[ "$cargo_version" != "$upstream_version" ]]; then
+            echo "::error::Cargo.toml version (${cargo_version}) does not match the upstream part of the tag (${upstream_version})."
+            exit 1
+          fi
+
+          if [[ "$EVENT_NAME" != "push" ]]; then
+            if ! git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+              echo "::error::Tag ${tag} does not exist; push the tag first."
+              exit 1
+            fi
+          fi
+
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "upstream_version=${upstream_version}" >> "$GITHUB_OUTPUT"
+          echo "orbita_build=${orbita_build}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build x86_64-unknown-linux-gnu
+    needs: [validate]
+    # ubuntu-22.04 on purpose: links against glibc 2.35 (upstream #3573);
+    # the Orbita agent image is debian:bookworm-slim (glibc 2.36).
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ env.TARGET }}
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          prefix-key: ubuntu-22.04-${{ env.TARGET }}
+
+      - name: Build release
+        shell: bash
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          cargo build --release --locked --features "${RELEASE_CARGO_FEATURES}" --target "${TARGET}"
+          echo "cargo build took $(( $(date +%s) - start )) s"
+
+      - name: Check binary size
+        shell: bash
+        run: bash scripts/ci/check_binary_size.sh "target/${TARGET}/release/zeroclaw" "${TARGET}"
+        env:
+          BINARY_SIZE_HARD_LIMIT: "52428800" # 50MB — same as upstream
+
+      - name: Package
+        shell: bash
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p staging
+          cp "target/${TARGET}/release/zeroclaw" staging/
+          cp LICENSE-APACHE LICENSE-MIT NOTICE staging/
+          {
+            echo "Orbita build of ZeroClaw — NOT an official ZeroClaw release (see NOTICE)."
+            echo "tag=${TAG}"
+            echo "commit=${GITHUB_SHA}"
+            echo "upstream_version=${{ needs.validate.outputs.upstream_version }}"
+            echo "orbita_build=${{ needs.validate.outputs.orbita_build }}"
+            echo "target=${TARGET}"
+            echo "toolchain=$(rustc --version)"
+            echo "runner=ubuntu-22.04"
+            echo "features=default,${RELEASE_CARGO_FEATURES}"
+            echo "source=https://github.com/${GITHUB_REPOSITORY}"
+            echo "zeroclaw_version=$(staging/zeroclaw --version 2>/dev/null || true)"
+          } > staging/ORBITA-BUILD-INFO.txt
+          cat staging/ORBITA-BUILD-INFO.txt
+          (cd staging && tar czf "../zeroclaw-${TARGET}.tar.gz" zeroclaw LICENSE-APACHE LICENSE-MIT NOTICE ORBITA-BUILD-INFO.txt)
+          {
+            sha256sum "zeroclaw-${TARGET}.tar.gz"
+            (cd staging && sha256sum zeroclaw | sed 's|  zeroclaw$|  zeroclaw (binary inside the tarball)|')
+          } > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: zeroclaw-${{ env.TARGET }}
+          path: |
+            zeroclaw-${{ env.TARGET }}.tar.gz
+            SHA256SUMS
+          retention-days: 14
+
+  publish:
+    name: Publish release
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: zeroclaw-${{ env.TARGET }}
+          path: release-assets
+      - name: Write release notes
+        shell: bash
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+          UPSTREAM: ${{ needs.validate.outputs.upstream_version }}
+        run: |
+          set -euo pipefail
+          {
+            echo "Orbita build of ZeroClaw v${UPSTREAM} — **not an official ZeroClaw release** (see NOTICE)."
+            echo
+            echo "Contract: ORBITA-BUILD.md. Target: ${TARGET}, toolchain ${RUST_TOOLCHAIN}, runner ubuntu-22.04,"
+            echo "features: default + ${RELEASE_CARGO_FEATURES}."
+            echo
+            echo "## Commits on top of upstream v${UPSTREAM}"
+            echo
+            if git rev-parse -q --verify "refs/tags/v${UPSTREAM}" >/dev/null; then
+              git log --no-merges --pretty=format:'- %h %s' "v${UPSTREAM}..${TAG}" || true
+            else
+              echo "(upstream tag v${UPSTREAM} not present in this clone)"
+            fi
+            echo
+            echo
+            echo "## SHA256"
+            echo
+            echo '```'
+            cat release-assets/SHA256SUMS
+            echo '```'
+          } > release-notes.md
+          cat release-notes.md
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          gh release create "$TAG" release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG (Orbita build)" \
+            --notes-file release-notes.md

@@ -1,0 +1,38 @@
+# Targeted tests for the Orbita branch. Upstream ci.yml only runs on pull
+# requests into master, so pushes to orbita/* would otherwise go unchecked.
+name: Orbita CI
+
+on:
+  push:
+    branches: ["orbita/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  test:
+    name: Test (config, personality, prompt, gateway personality API)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: "1.93.0"
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          cache-on-failure: true
+      - name: Ensure web/dist placeholder exists
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
+      - name: Install system dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y libudev-dev
+      - name: Run targeted tests
+        run: |
+          cargo test --locked -p zeroclaw-config --lib
+          cargo test --locked -p zeroclaw-runtime --lib -- agent::personality agent::prompt
+          cargo test --locked -p zeroclaw-gateway --lib -- api_personality
