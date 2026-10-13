@@ -791,6 +791,7 @@ impl Agent {
             dispatcher_instructions: &instructions,
             security_summary: self.security_summary.clone(),
             autonomy_level: self.autonomy_level,
+            workspace_file_max_chars: self.config.workspace_file_max_chars,
         };
         self.prompt_builder.build(&ctx)
     }

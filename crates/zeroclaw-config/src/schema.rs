@@ -1545,6 +1545,12 @@ pub struct AgentConfig {
     /// Maximum conversation history messages retained per session. Default: `50`.
     #[serde(default = "default_agent_max_history_messages")]
     pub max_history_messages: usize,
+    /// Maximum characters per workspace personality file (`SOUL.md`, `AGENTS.md`,
+    /// `TOOLS.md`, …) injected into the system prompt; longer files are cut with a
+    /// `[... truncated at N chars …]` marker. Set to `0` to disable truncation.
+    /// Default: `20000`.
+    #[serde(default = "default_agent_workspace_file_max_chars")]
+    pub workspace_file_max_chars: usize,
     /// Maximum estimated tokens for conversation history before compaction triggers.
     /// Uses ~4 chars/token heuristic. When this threshold is exceeded, older messages
     /// are summarized to preserve context while staying within budget. Default: `32000`.
@@ -1637,6 +1643,10 @@ fn default_agent_max_history_messages() -> usize {
     50
 }
 
+fn default_agent_workspace_file_max_chars() -> usize {
+    20_000
+}
+
 fn default_agent_max_context_tokens() -> usize {
     32_000
 }
@@ -1655,6 +1665,7 @@ impl Default for AgentConfig {
             compact_context: true,
             max_tool_iterations: default_agent_max_tool_iterations(),
             max_history_messages: default_agent_max_history_messages(),
+            workspace_file_max_chars: default_agent_workspace_file_max_chars(),
             max_context_tokens: default_agent_max_context_tokens(),
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
@@ -13008,8 +13019,21 @@ reasoning_effort = "turbo"
         assert!(cfg.compact_context);
         assert_eq!(cfg.max_tool_iterations, 10);
         assert_eq!(cfg.max_history_messages, 50);
+        assert_eq!(cfg.workspace_file_max_chars, 20_000);
         assert!(!cfg.parallel_tools);
         assert_eq!(cfg.tool_dispatcher, "auto");
+    }
+
+    #[test]
+    async fn agent_config_workspace_file_max_chars_parses_and_defaults() {
+        let parsed = parse_test_config("[agent]\nworkspace_file_max_chars = 30000\n");
+        assert_eq!(parsed.agent.workspace_file_max_chars, 30_000);
+
+        let parsed = parse_test_config("[agent]\nworkspace_file_max_chars = 0\n");
+        assert_eq!(parsed.agent.workspace_file_max_chars, 0);
+
+        let parsed = parse_test_config("[agent]\nmax_history_messages = 80\n");
+        assert_eq!(parsed.agent.workspace_file_max_chars, 20_000);
     }
 
     #[test]

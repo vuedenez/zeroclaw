@@ -26,6 +26,9 @@ pub struct PromptContext<'a> {
     /// includes "ask before acting" instructions. Full autonomy omits them
     /// so the model executes tools directly without simulating approval.
     pub autonomy_level: AutonomyLevel,
+    /// Per-file character cap for the workspace personality files rendered by
+    /// [`IdentitySection`] (`[agent] workspace_file_max_chars`, `0` = unlimited).
+    pub workspace_file_max_chars: usize,
 }
 
 pub trait PromptSection: Send + Sync {
@@ -111,7 +114,10 @@ impl PromptSection for IdentitySection {
         }
 
         // Use the personality module for structured file loading.
-        let profile = personality::load_personality(ctx.workspace_dir);
+        let profile = personality::load_personality_with_limit(
+            ctx.workspace_dir,
+            ctx.workspace_file_max_chars,
+        );
         prompt.push_str(&profile.render());
 
         Ok(prompt)
@@ -324,6 +330,40 @@ mod tests {
     }
 
     #[test]
+    fn identity_section_honours_configured_file_cap() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_prompt_cap_test_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("AGENTS.md"), "a".repeat(25_000)).unwrap();
+        let tools: Vec<Box<dyn Tool>> = vec![];
+
+        let mut ctx = PromptContext {
+            workspace_file_max_chars: 30_000,
+            workspace_dir: &workspace,
+            model_name: "test-model",
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+            security_summary: None,
+            autonomy_level: AutonomyLevel::Supervised,
+        };
+        let with_cap_raised = IdentitySection.build(&ctx).unwrap();
+        assert!(!with_cap_raised.contains("[... truncated at"));
+        assert!(with_cap_raised.contains(&"a".repeat(25_000)));
+
+        ctx.workspace_file_max_chars = personality::MAX_FILE_CHARS;
+        let with_default_cap = IdentitySection.build(&ctx).unwrap();
+        assert!(with_default_cap.contains("[... truncated at 20000 chars"));
+        assert!(!with_default_cap.contains(&"a".repeat(20_001)));
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
     fn identity_section_with_aieos_includes_workspace_files() {
         let workspace =
             std::env::temp_dir().join(format!("zeroclaw_prompt_test_{}", uuid::Uuid::new_v4()));
@@ -342,6 +382,7 @@ mod tests {
 
         let tools: Vec<Box<dyn Tool>> = vec![];
         let ctx = PromptContext {
+            workspace_file_max_chars: personality::MAX_FILE_CHARS,
             workspace_dir: &workspace,
             model_name: "test-model",
             tools: &tools,
@@ -373,6 +414,7 @@ mod tests {
     fn prompt_builder_assembles_sections() {
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(TestTool)];
         let ctx = PromptContext {
+            workspace_file_max_chars: personality::MAX_FILE_CHARS,
             workspace_dir: Path::new("/tmp"),
             model_name: "test-model",
             tools: &tools,
@@ -411,6 +453,7 @@ mod tests {
         }];
 
         let ctx = PromptContext {
+            workspace_file_max_chars: personality::MAX_FILE_CHARS,
             workspace_dir: Path::new("/tmp"),
             model_name: "test-model",
             tools: &tools,
@@ -453,6 +496,7 @@ mod tests {
         }];
 
         let ctx = PromptContext {
+            workspace_file_max_chars: personality::MAX_FILE_CHARS,
             workspace_dir: Path::new("/tmp/workspace"),
             model_name: "test-model",
             tools: &tools,
@@ -481,6 +525,7 @@ mod tests {
     fn datetime_section_includes_timestamp_and_timezone() {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let ctx = PromptContext {
+            workspace_file_max_chars: personality::MAX_FILE_CHARS,
             workspace_dir: Path::new("/tmp"),
             model_name: "test-model",
             tools: &tools,
@@ -522,6 +567,7 @@ mod tests {
             location: None,
         }];
         let ctx = PromptContext {
+            workspace_file_max_chars: personality::MAX_FILE_CHARS,
             workspace_dir: Path::new("/tmp/workspace"),
             model_name: "test-model",
             tools: &tools,
@@ -556,6 +602,7 @@ mod tests {
                         **Allowed shell commands**: `git`, `ls`.\n"
             .to_string();
         let ctx = PromptContext {
+            workspace_file_max_chars: personality::MAX_FILE_CHARS,
             workspace_dir: Path::new("/tmp"),
             model_name: "test-model",
             tools: &tools,
@@ -591,6 +638,7 @@ mod tests {
     fn safety_section_omits_security_policy_when_none() {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let ctx = PromptContext {
+            workspace_file_max_chars: personality::MAX_FILE_CHARS,
             workspace_dir: Path::new("/tmp"),
             model_name: "test-model",
             tools: &tools,
@@ -618,6 +666,7 @@ mod tests {
     fn safety_section_full_autonomy_omits_approval_instructions() {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let ctx = PromptContext {
+            workspace_file_max_chars: personality::MAX_FILE_CHARS,
             workspace_dir: Path::new("/tmp"),
             model_name: "test-model",
             tools: &tools,
@@ -653,6 +702,7 @@ mod tests {
     fn safety_section_supervised_includes_approval_instructions() {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let ctx = PromptContext {
+            workspace_file_max_chars: personality::MAX_FILE_CHARS,
             workspace_dir: Path::new("/tmp"),
             model_name: "test-model",
             tools: &tools,

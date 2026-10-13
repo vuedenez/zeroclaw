@@ -8,7 +8,9 @@
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
-/// Maximum characters per personality file before truncation.
+/// Default maximum characters per personality file before truncation.
+/// Overridable per run through `[agent] workspace_file_max_chars`
+/// (see [`load_personality_with_limit`]).
 pub const MAX_FILE_CHARS: usize = 20_000;
 
 /// Well-known personality files loaded from the workspace root.
@@ -58,6 +60,8 @@ pub struct PersonalityProfile {
     pub files: Vec<PersonalityFile>,
     /// Files that were expected but not found.
     pub missing: Vec<String>,
+    /// Per-file character limit the profile was loaded with (`0` = unlimited).
+    pub max_chars: usize,
 }
 
 impl PersonalityProfile {
@@ -83,7 +87,8 @@ impl PersonalityProfile {
             if file.truncated {
                 let _ = writeln!(
                     out,
-                    "\n\n[... truncated at {MAX_FILE_CHARS} chars — use `read` for full file]\n"
+                    "\n\n[... truncated at {} chars — use `read` for full file]\n",
+                    self.max_chars
                 );
             } else {
                 out.push_str("\n\n");
@@ -93,17 +98,38 @@ impl PersonalityProfile {
     }
 }
 
-/// Loads personality files from a workspace directory.
+/// Loads personality files from a workspace directory with the default
+/// per-file limit ([`MAX_FILE_CHARS`]).
 ///
 /// Each well-known file is read and validated.  Missing files are recorded
 /// in `PersonalityProfile::missing` rather than treated as errors.
 pub fn load_personality(workspace_dir: &Path) -> PersonalityProfile {
-    load_personality_files(workspace_dir, PERSONALITY_FILES)
+    load_personality_with_limit(workspace_dir, MAX_FILE_CHARS)
 }
 
-/// Load a specific set of personality files from a workspace directory.
+/// Loads personality files with an explicit per-file character limit
+/// (`[agent] workspace_file_max_chars`). `max_chars == 0` disables truncation.
+pub fn load_personality_with_limit(workspace_dir: &Path, max_chars: usize) -> PersonalityProfile {
+    load_personality_files_with_limit(workspace_dir, PERSONALITY_FILES, max_chars)
+}
+
+/// Load a specific set of personality files from a workspace directory with
+/// the default per-file limit ([`MAX_FILE_CHARS`]).
 pub fn load_personality_files(workspace_dir: &Path, filenames: &[&str]) -> PersonalityProfile {
-    let mut profile = PersonalityProfile::default();
+    load_personality_files_with_limit(workspace_dir, filenames, MAX_FILE_CHARS)
+}
+
+/// Load a specific set of personality files with an explicit per-file
+/// character limit. `max_chars == 0` disables truncation.
+pub fn load_personality_files_with_limit(
+    workspace_dir: &Path,
+    filenames: &[&str],
+    max_chars: usize,
+) -> PersonalityProfile {
+    let mut profile = PersonalityProfile {
+        max_chars,
+        ..PersonalityProfile::default()
+    };
 
     for &filename in filenames {
         let path = workspace_dir.join(filename);
@@ -114,7 +140,7 @@ pub fn load_personality_files(workspace_dir: &Path, filenames: &[&str]) -> Perso
                     profile.missing.push(filename.to_string());
                     continue;
                 }
-                let (content, truncated) = truncate_content(trimmed);
+                let (content, truncated) = truncate_content(trimmed, max_chars);
                 profile.files.push(PersonalityFile {
                     name: filename.to_string(),
                     content,
@@ -131,14 +157,14 @@ pub fn load_personality_files(workspace_dir: &Path, filenames: &[&str]) -> Perso
     profile
 }
 
-/// Truncate content to `MAX_FILE_CHARS` if necessary.
-fn truncate_content(content: &str) -> (String, bool) {
-    if content.chars().count() <= MAX_FILE_CHARS {
+/// Truncate content to `max_chars` characters if necessary (`0` = never).
+fn truncate_content(content: &str, max_chars: usize) -> (String, bool) {
+    if max_chars == 0 || content.chars().count() <= max_chars {
         return (content.to_string(), false);
     }
     let truncated = content
         .char_indices()
-        .nth(MAX_FILE_CHARS)
+        .nth(max_chars)
         .map(|(idx, _)| &content[..idx])
         .unwrap_or(content);
     (truncated.to_string(), true)
@@ -208,6 +234,62 @@ mod tests {
         let soul = profile.files.iter().find(|f| f.name == "SOUL.md").unwrap();
         assert!(soul.truncated);
         assert_eq!(soul.content.chars().count(), MAX_FILE_CHARS);
+
+        let _ = std::fs::remove_dir_all(ws);
+    }
+
+    #[test]
+    fn default_loader_keeps_upstream_limit_and_marker() {
+        let large = "x".repeat(MAX_FILE_CHARS + 1);
+        let ws = setup_workspace(&[("AGENTS.md", &large)]);
+
+        let profile = load_personality(&ws);
+        let f = profile.files.iter().find(|f| f.name == "AGENTS.md").unwrap();
+        assert!(f.truncated);
+        assert_eq!(f.content.chars().count(), MAX_FILE_CHARS);
+        assert!(profile.render().contains("[... truncated at 20000 chars"));
+
+        let _ = std::fs::remove_dir_all(ws);
+    }
+
+    #[test]
+    fn custom_limit_keeps_file_under_limit_intact() {
+        let content = "x".repeat(24_000);
+        let ws = setup_workspace(&[("AGENTS.md", &content)]);
+
+        let profile = load_personality_with_limit(&ws, 25_000);
+        let f = profile.files.iter().find(|f| f.name == "AGENTS.md").unwrap();
+        assert!(!f.truncated);
+        assert_eq!(f.content.chars().count(), 24_000);
+        assert!(!profile.render().contains("[... truncated at"));
+
+        let _ = std::fs::remove_dir_all(ws);
+    }
+
+    #[test]
+    fn custom_limit_truncates_file_over_limit_with_actual_limit_in_marker() {
+        let content = "x".repeat(26_000);
+        let ws = setup_workspace(&[("AGENTS.md", &content)]);
+
+        let profile = load_personality_with_limit(&ws, 25_000);
+        let f = profile.files.iter().find(|f| f.name == "AGENTS.md").unwrap();
+        assert!(f.truncated);
+        assert_eq!(f.content.chars().count(), 25_000);
+        assert!(profile.render().contains("[... truncated at 25000 chars"));
+
+        let _ = std::fs::remove_dir_all(ws);
+    }
+
+    #[test]
+    fn zero_limit_disables_truncation() {
+        let content = "x".repeat(MAX_FILE_CHARS + 5_000);
+        let ws = setup_workspace(&[("AGENTS.md", &content)]);
+
+        let profile = load_personality_with_limit(&ws, 0);
+        let f = profile.files.iter().find(|f| f.name == "AGENTS.md").unwrap();
+        assert!(!f.truncated);
+        assert_eq!(f.content.chars().count(), MAX_FILE_CHARS + 5_000);
+        assert!(!profile.render().contains("[... truncated at"));
 
         let _ = std::fs::remove_dir_all(ws);
     }

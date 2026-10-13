@@ -25,7 +25,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
-use zeroclaw_runtime::agent::personality::{EDITABLE_PERSONALITY_FILES, MAX_FILE_CHARS};
+use zeroclaw_runtime::agent::personality::EDITABLE_PERSONALITY_FILES;
 use zeroclaw_runtime::agent::personality_templates::{TemplateContext, render_preset_default};
 
 use super::AppState;
@@ -156,8 +156,9 @@ fn mtime_ms_of(meta: &std::fs::Metadata) -> Option<i64> {
         .and_then(|d| i64::try_from(d.as_millis()).ok())
 }
 
+/// `max == 0` means no limit (mirrors `[agent] workspace_file_max_chars`).
 fn truncate_to_chars(content: &str, max: usize) -> (String, bool) {
-    if content.chars().count() <= max {
+    if max == 0 || content.chars().count() <= max {
         return (content.to_string(), false);
     }
     let cut = content
@@ -180,9 +181,9 @@ pub async fn handle_index(
         return e.into_response();
     }
 
-    let workspace_dir = {
+    let (workspace_dir, max_chars) = {
         let cfg = state.config.lock();
-        cfg.workspace_dir.clone()
+        (cfg.workspace_dir.clone(), cfg.agent.workspace_file_max_chars)
     };
 
     let files: Vec<PersonalityIndexEntry> = EDITABLE_PERSONALITY_FILES
@@ -207,10 +208,7 @@ pub async fn handle_index(
         })
         .collect();
 
-    Json(PersonalityIndex {
-        files,
-        max_chars: MAX_FILE_CHARS,
-    })
+    Json(PersonalityIndex { files, max_chars })
     .into_response()
 }
 
@@ -230,15 +228,15 @@ pub async fn handle_get(
         Err(e) => return e.into_response(),
     };
 
-    let workspace_dir = {
+    let (workspace_dir, max_chars) = {
         let cfg = state.config.lock();
-        cfg.workspace_dir.clone()
+        (cfg.workspace_dir.clone(), cfg.agent.workspace_file_max_chars)
     };
     let path = personality_path(&workspace_dir, q.agent.as_deref(), allowed);
 
     match std::fs::read_to_string(&path) {
         Ok(raw) => {
-            let (content, truncated) = truncate_to_chars(&raw, MAX_FILE_CHARS);
+            let (content, truncated) = truncate_to_chars(&raw, max_chars);
             let mtime_ms = std::fs::metadata(&path).ok().and_then(|m| mtime_ms_of(&m));
             Json(PersonalityFileResponse {
                 filename: allowed.to_string(),
@@ -286,12 +284,13 @@ pub async fn handle_put(
         Err(e) => return e.into_response(),
     };
 
-    if body.content.chars().count() > MAX_FILE_CHARS {
+    let max_chars = state.config.lock().agent.workspace_file_max_chars;
+    if max_chars > 0 && body.content.chars().count() > max_chars {
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
             Json(serde_json::json!({
                 "error": "content exceeds MAX_FILE_CHARS",
-                "max_chars": MAX_FILE_CHARS,
+                "max_chars": max_chars,
             })),
         )
             .into_response();
@@ -405,6 +404,7 @@ pub async fn handle_templates(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeroclaw_runtime::agent::personality::MAX_FILE_CHARS;
 
     #[test]
     fn validate_filename_accepts_allowlist() {
@@ -452,5 +452,13 @@ mod tests {
         let (out, trunc) = truncate_to_chars("hello", MAX_FILE_CHARS);
         assert!(!trunc);
         assert_eq!(out, "hello");
+    }
+
+    #[test]
+    fn zero_limit_never_truncates() {
+        let s = "x".repeat(MAX_FILE_CHARS + 100);
+        let (out, trunc) = truncate_to_chars(&s, 0);
+        assert!(!trunc);
+        assert_eq!(out.chars().count(), MAX_FILE_CHARS + 100);
     }
 }

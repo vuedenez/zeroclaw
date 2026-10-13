@@ -1080,6 +1080,7 @@ impl DelegateTool {
 
             security_summary: None,
             autonomy_level: crate::security::AutonomyLevel::default(),
+            workspace_file_max_chars: crate::agent::personality::MAX_FILE_CHARS,
         };
 
         let builder = SystemPromptBuilder::default()
