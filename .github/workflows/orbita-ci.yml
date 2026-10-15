@@ -1,5 +1,7 @@
 # Targeted tests for the Orbita branch. Upstream ci.yml only runs on pull
 # requests into master, so pushes to orbita/* would otherwise go unchecked.
+# The full workspace test run (same command as upstream ci.yml `test` job) is
+# manual: `gh workflow run orbita-ci.yml --ref orbita/v0.7.5`.
 name: Orbita CI
 
 on:
@@ -36,3 +38,29 @@ jobs:
           cargo test --locked -p zeroclaw-config --lib
           cargo test --locked -p zeroclaw-runtime --lib -- agent::personality agent::prompt
           cargo test --locked -p zeroclaw-gateway --lib -- api_personality
+
+  full-test:
+    name: Full workspace tests (nextest, as upstream ci.yml)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: "1.93.0"
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          cache-on-failure: true
+          prefix-key: orbita-full-test
+      - name: Ensure web/dist placeholder exists
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
+      - name: Install system dependencies and mold linker
+        run: sudo apt-get update -qq && sudo apt-get install -y libudev-dev mold
+      - name: Install cargo-nextest
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
+      - name: Run tests
+        run: cargo nextest run --locked --workspace --exclude zeroclaw-desktop
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
