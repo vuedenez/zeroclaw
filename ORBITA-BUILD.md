@@ -21,11 +21,11 @@ with them upstream.
 | Trigger | push of a matching tag, or `workflow_dispatch` with an existing tag |
 | Runner | `ubuntu-22.04` (glibc 2.35, upstream #3573) |
 | Toolchain | Rust `1.93.0` (the toolchain of the upstream v0.7.5 release) |
-| Target | `x86_64-unknown-linux-gnu` only (Orbita deploy hosts are amd64) |
-| Command | `cargo build --release --locked --features "channel-matrix,channel-lark,whatsapp-web" --target x86_64-unknown-linux-gnu` — default features are kept, the extra features are upstream's `RELEASE_CARGO_FEATURES` |
+| Targets | `x86_64-unknown-linux-gnu` (Orbita deploy hosts are amd64) and `aarch64-unknown-linux-gnu` (local arm64 image builds; cross-linked with `gcc-aarch64-linux-gnu` exactly as upstream) |
+| Command | `cargo build --release --locked --features "channel-matrix,channel-lark,whatsapp-web" --target <target>` — default features are kept, the extra features are upstream's `RELEASE_CARGO_FEATURES` |
 | Release profile | `Cargo.toml` as upstream (`panic = "abort"`, `lto`, `strip`) |
-| Artifact | `zeroclaw-x86_64-unknown-linux-gnu.tar.gz` containing `zeroclaw`, `LICENSE-APACHE`, `LICENSE-MIT`, `NOTICE`, `ORBITA-BUILD-INFO.txt` |
-| Checksums | `SHA256SUMS` next to the tarball: the tarball and the binary inside it |
+| Artifacts | `zeroclaw-<target>.tar.gz` per target, each containing `zeroclaw`, `LICENSE-APACHE`, `LICENSE-MIT`, `NOTICE`, `ORBITA-BUILD-INFO.txt` |
+| Checksums | `SHA256SUMS` next to the tarballs: for each target, the tarball and the binary inside it |
 
 Differences from the upstream release workflow, on purpose:
 
@@ -35,8 +35,8 @@ Differences from the upstream release workflow, on purpose:
 - `zeroclaw --version` still prints the upstream version; the Orbita marker
   lives in `ORBITA-BUILD-INFO.txt` and in the release notes.
 
-Consumers pin the **binary's** SHA256 (from `SHA256SUMS`, second line) in
-their own Dockerfile. `SHA256SUMS` published next to the tarball is a
+Consumers pin the **binary's** SHA256 (the `zeroclaw (binary inside …)`
+lines of `SHA256SUMS`, one per target) in their own Dockerfile. `SHA256SUMS` published next to the tarball is a
 convenience, not a source of truth: anyone who can replace the tarball can
 replace it too.
 
@@ -51,7 +51,10 @@ git push fork orbita/v0.7.5 v0.7.5-orbita.<N>
 
 The `Orbita Release` workflow builds, packages and publishes a GitHub
 release for the tag. `Orbita CI` runs targeted tests on every push to the
-branch (upstream `ci.yml` only runs on pull requests into `master`).
+branch (upstream `ci.yml` only runs on pull requests into `master`); its
+manual run (`gh workflow run orbita-ci.yml --ref orbita/v0.7.5`) adds the
+full workspace test suite, the same `cargo nextest run --workspace --exclude
+zeroclaw-desktop` as upstream `ci.yml`.
 
 ## Patches
 

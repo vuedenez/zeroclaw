@@ -3,10 +3,11 @@
 # Derived from release-stable-manual.yml at upstream tag v0.7.5. Differences:
 #   * trigger / validation accept only `v<X.Y.Z>-orbita.<N>` tags, where
 #     `X.Y.Z` must equal the `version` in Cargo.toml (the upstream base);
-#   * a single target (x86_64-unknown-linux-gnu) — the Orbita deploy hosts
-#     are amd64; the toolchain (1.93.0), runner (ubuntu-22.04, glibc 2.35),
+#   * two targets: x86_64-unknown-linux-gnu (the Orbita deploy hosts are
+#     amd64) and aarch64-unknown-linux-gnu (local arm64 image builds); the
+#     toolchain (1.93.0), runner (ubuntu-22.04, glibc 2.35), cross linker,
 #     build command and cargo features are byte-identical to upstream's for
-#     this target;
+#     these targets;
 #   * no web dashboard, desktop, docker, scoop/aur/homebrew, tweet/discord
 #     jobs: the `embedded-web` feature is not part of the release feature
 #     set, so `web/dist` never reaches the binary and is not packaged;
@@ -37,7 +38,6 @@ env:
   # Same as upstream RELEASE_CARGO_FEATURES; applied on top of default features.
   RELEASE_CARGO_FEATURES: channel-matrix,channel-lark,whatsapp-web
   RUST_TOOLCHAIN: "1.93.0"
-  TARGET: x86_64-unknown-linux-gnu
 
 jobs:
   validate:
@@ -92,12 +92,24 @@ jobs:
           echo "orbita_build=${orbita_build}" >> "$GITHUB_OUTPUT"
 
   build:
-    name: Build x86_64-unknown-linux-gnu
+    name: Build ${{ matrix.target }}
     needs: [validate]
     # ubuntu-22.04 on purpose: links against glibc 2.35 (upstream #3573);
     # the Orbita agent image is debian:bookworm-slim (glibc 2.36).
     runs-on: ubuntu-22.04
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Same matrix entries as upstream release-stable-manual.yml @ v0.7.5.
+          - target: x86_64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-gnu
+            cross_compiler: gcc-aarch64-linux-gnu
+            linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
+            linker: aarch64-linux-gnu-gcc
+    env:
+      TARGET: ${{ matrix.target }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -105,15 +117,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-          targets: ${{ env.TARGET }}
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         with:
-          prefix-key: ubuntu-22.04-${{ env.TARGET }}
+          prefix-key: ubuntu-22.04-${{ matrix.target }}
+
+      - name: Install cross compiler
+        if: matrix.cross_compiler
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ${{ matrix.cross_compiler }}
 
       - name: Build release
         shell: bash
         run: |
           set -euo pipefail
+          if [ -n "${{ matrix.linker_env || '' }}" ] && [ -n "${{ matrix.linker || '' }}" ]; then
+            export "${{ matrix.linker_env }}=${{ matrix.linker }}"
+          fi
           start=$(date +%s)
           cargo build --release --locked --features "${RELEASE_CARGO_FEATURES}" --target "${TARGET}"
           echo "cargo build took $(( $(date +%s) - start )) s"
@@ -144,22 +165,23 @@ jobs:
             echo "runner=ubuntu-22.04"
             echo "features=default,${RELEASE_CARGO_FEATURES}"
             echo "source=https://github.com/${GITHUB_REPOSITORY}"
-            echo "zeroclaw_version=$(staging/zeroclaw --version 2>/dev/null || true)"
+            # The aarch64 binary cannot run on the x86_64 runner.
+            echo "zeroclaw_version=$(staging/zeroclaw --version 2>/dev/null || echo "n/a (cross-compiled)")"
           } > staging/ORBITA-BUILD-INFO.txt
           cat staging/ORBITA-BUILD-INFO.txt
           (cd staging && tar czf "../zeroclaw-${TARGET}.tar.gz" zeroclaw LICENSE-APACHE LICENSE-MIT NOTICE ORBITA-BUILD-INFO.txt)
           {
             sha256sum "zeroclaw-${TARGET}.tar.gz"
-            (cd staging && sha256sum zeroclaw | sed 's|  zeroclaw$|  zeroclaw (binary inside the tarball)|')
-          } > SHA256SUMS
-          cat SHA256SUMS
+            (cd staging && sha256sum zeroclaw | sed "s|  zeroclaw\$|  zeroclaw (binary inside zeroclaw-${TARGET}.tar.gz)|")
+          } > "SHA256SUMS-${TARGET}"
+          cat "SHA256SUMS-${TARGET}"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: zeroclaw-${{ env.TARGET }}
+          name: zeroclaw-${{ matrix.target }}
           path: |
-            zeroclaw-${{ env.TARGET }}.tar.gz
-            SHA256SUMS
+            zeroclaw-${{ matrix.target }}.tar.gz
+            SHA256SUMS-${{ matrix.target }}
           retention-days: 14
 
   publish:
@@ -173,8 +195,20 @@ jobs:
           fetch-depth: 0
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: zeroclaw-${{ env.TARGET }}
-          path: release-assets
+          pattern: zeroclaw-*
+          path: build-artifacts
+          merge-multiple: true
+      - name: Collect release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            test -f "build-artifacts/zeroclaw-${target}.tar.gz" || { echo "::error::Missing zeroclaw-${target}.tar.gz"; exit 1; }
+            cp "build-artifacts/zeroclaw-${target}.tar.gz" release-assets/
+            cat "build-artifacts/SHA256SUMS-${target}" >> release-assets/SHA256SUMS
+          done
+          cat release-assets/SHA256SUMS
       - name: Write release notes
         shell: bash
         env:
@@ -185,7 +219,7 @@ jobs:
           {
             echo "Orbita build of ZeroClaw v${UPSTREAM} — **not an official ZeroClaw release** (see NOTICE)."
             echo
-            echo "Contract: ORBITA-BUILD.md. Target: ${TARGET}, toolchain ${RUST_TOOLCHAIN}, runner ubuntu-22.04,"
+            echo "Contract: ORBITA-BUILD.md. Targets: x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu; toolchain ${RUST_TOOLCHAIN}, runner ubuntu-22.04,"
             echo "features: default + ${RELEASE_CARGO_FEATURES}."
             echo
             echo "## Commits on top of upstream v${UPSTREAM}"
