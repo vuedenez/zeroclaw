@@ -42,6 +42,11 @@ pub struct Agent {
     auto_save: bool,
     memory_session_id: Option<String>,
     history: Vec<ConversationMessage>,
+    /// The current turn's user entry exactly as pushed into `history` — the
+    /// anchor the `history_trim_keep` batch cut stops at (Orbita patch P6).
+    /// Matched by content: the XML dispatcher stores tool results as `user`
+    /// chat entries too, so the role alone does not identify the request.
+    turn_request: Option<String>,
     classification_config: zeroclaw_config::schema::QueryClassificationConfig,
     available_hints: Vec<String>,
     route_model_by_hint: HashMap<String, String>,
@@ -382,6 +387,7 @@ impl AgentBuilder {
             auto_save: self.auto_save.unwrap_or(false),
             memory_session_id: self.memory_session_id,
             history: Vec::new(),
+            turn_request: None,
             classification_config: self.classification_config.unwrap_or_default(),
             available_hints: self.available_hints.unwrap_or_default(),
             route_model_by_hint: self.route_model_by_hint.unwrap_or_default(),
@@ -761,14 +767,16 @@ impl Agent {
             let before = other_messages.len();
             let mut drop_count = before - keep;
             if keep < max
-                && let Some(user_idx) = other_messages.iter().rposition(
-                    |msg| matches!(msg, ConversationMessage::Chat(chat) if chat.role == "user"),
-                )
+                && let Some(request) = self.turn_request.as_deref()
+                && let Some(request_idx) = other_messages.iter().rposition(|msg| {
+                    matches!(msg, ConversationMessage::Chat(chat)
+                        if chat.role == "user" && chat.content == request)
+                })
             {
-                // The batch cut stops at the current turn's user message: it
-                // goes only once the upstream trim would drop it too, so a long
-                // tool turn keeps its request in view as long as upstream does.
-                drop_count = drop_count.min(user_idx).max(before - max);
+                // The batch cut stops at the current turn's request: it goes
+                // only once the upstream trim would drop it too, so a long tool
+                // turn keeps its request in view as long as upstream does.
+                drop_count = drop_count.min(request_idx).max(before - max);
             }
 
             // Avoid creating orphan ToolResults: if the first message remaining
@@ -1130,6 +1138,7 @@ impl Agent {
             format!("[CURRENT DATE & TIME: {date_str}]\n\n{context}\n\n{user_message}")
         };
 
+        self.turn_request = Some(enriched.clone());
         self.history
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
 
@@ -1301,6 +1310,7 @@ impl Agent {
             format!("{context}[{now}] {user_message}")
         };
 
+        self.turn_request = Some(enriched.clone());
         self.history
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
 
@@ -2863,6 +2873,24 @@ mod tests {
         }
     }
 
+    /// XML-dispatcher shape of a round: the call lives in the assistant text,
+    /// the result is a `user` chat entry (`XmlToolDispatcher::format_results`).
+    fn xml_call_entry(i: usize) -> ConversationMessage {
+        ConversationMessage::AssistantToolCalls {
+            text: Some(format!(
+                "<tool_call>{{\"name\": \"mock\", \"arguments\": {{\"n\": {i}}}}}</tool_call>"
+            )),
+            tool_calls: vec![],
+            reasoning_content: None,
+        }
+    }
+
+    fn xml_result_entry(i: usize) -> ConversationMessage {
+        ConversationMessage::Chat(ChatMessage::user(format!(
+            "[Tool results]\n<tool_result name=\"mock\" status=\"ok\">\nresult{i}\n</tool_result>\n"
+        )))
+    }
+
     /// `n` entries of earlier turns: alternating user / assistant texts.
     fn earlier_turns(n: usize) -> Vec<ConversationMessage> {
         (0..n)
@@ -2986,27 +3014,41 @@ mod tests {
         keep: usize,
         rounds: usize,
     ) -> (Vec<usize>, Vec<usize>, Option<usize>) {
+        run_rounds(earlier, max, keep, rounds, false)
+    }
+
+    fn run_rounds(
+        earlier: usize,
+        max: usize,
+        keep: usize,
+        rounds: usize,
+        xml: bool,
+    ) -> (Vec<usize>, Vec<usize>, Option<usize>) {
         let mut agent = trim_test_agent(max, keep);
         agent.history.extend(earlier_turns(earlier));
         agent
             .history
             .push(ConversationMessage::Chat(ChatMessage::user("start")));
+        agent.turn_request = Some("start".into());
         let task = serde_json::to_string(agent.history.last().unwrap()).unwrap();
         let (mut lens, mut head_changes, mut task_dropped) = (Vec::new(), Vec::new(), None);
         for round in 1..=rounds {
             let prev = history_json(&agent);
-            agent.history.push(tool_call_entry(round));
-            agent.history.push(tool_result_entry(round));
+            let pair = if xml {
+                [xml_call_entry(round), xml_result_entry(round)]
+            } else {
+                [tool_call_entry(round), tool_result_entry(round)]
+            };
+            let pair_json: Vec<String> = pair
+                .iter()
+                .map(|m| serde_json::to_string(m).unwrap())
+                .collect();
+            agent.history.extend(pair);
             agent.trim_history();
             assert_system_first_and_pairs_intact(&agent);
-            // The current call/result pair always survives the cut.
-            let current = format!("tc{round}");
-            assert!(matches!(
-                &agent.history[agent.history.len() - 2..],
-                [ConversationMessage::AssistantToolCalls { tool_calls, .. }, ConversationMessage::ToolResults(_)]
-                    if tool_calls[0].id == current
-            ));
             let now = history_json(&agent);
+            // The current call/result pair always survives the cut.
+            assert_eq!(now[now.len() - 2..], pair_json[..]);
             if !now.starts_with(&prev) {
                 head_changes.push(round);
             }
@@ -3044,12 +3086,30 @@ mod tests {
     /// The batch cut never drops the current turn's user message earlier
     /// than upstream: in a 30-round turn at 50/30 it leaves in round 25 for
     /// any history before the turn, exactly as upstream, while the head of
-    /// the history changes at most 5 times (upstream: 6 to 29 times).
+    /// the history changes at most 5 times (upstream: 6 to 30 times).
     #[test]
     fn history_trim_keep_keeps_current_request_as_long_as_upstream() {
         for earlier in 0..50 {
             let (_, keyed_heads, keyed_drop) = run_tool_rounds(earlier, 50, 30, 30);
             let (_, upstream_heads, upstream_drop) = run_tool_rounds(earlier, 50, 0, 30);
+            assert_eq!(keyed_drop, Some(25), "earlier={earlier}");
+            assert_eq!(upstream_drop, Some(25), "earlier={earlier}");
+            assert!(keyed_heads.len() <= 5, "earlier={earlier}: {keyed_heads:?}");
+            assert!(
+                upstream_heads.len() >= 6,
+                "earlier={earlier}: {upstream_heads:?}"
+            );
+        }
+    }
+
+    /// XML dispatcher: tool results are `user` chat entries, so the anchor is
+    /// the turn's request by content, not the last `user` entry. With 20
+    /// earlier entries the request outlives rounds 15-24 exactly as upstream.
+    #[test]
+    fn history_trim_keep_anchor_ignores_xml_tool_results() {
+        for earlier in 0..50 {
+            let (_, keyed_heads, keyed_drop) = run_rounds(earlier, 50, 30, 30, true);
+            let (_, upstream_heads, upstream_drop) = run_rounds(earlier, 50, 0, 30, true);
             assert_eq!(keyed_drop, Some(25), "earlier={earlier}");
             assert_eq!(upstream_drop, Some(25), "earlier={earlier}");
             assert!(keyed_heads.len() <= 5, "earlier={earlier}: {keyed_heads:?}");
