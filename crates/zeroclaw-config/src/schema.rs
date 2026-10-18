@@ -1545,6 +1545,19 @@ pub struct AgentConfig {
     /// Maximum conversation history messages retained per session. Default: `50`.
     #[serde(default = "default_agent_max_history_messages")]
     pub max_history_messages: usize,
+    /// History entries kept once the session history overflows
+    /// `max_history_messages`: the overflowing trim drops the oldest entries
+    /// down to this low-water mark in one go, so the head of the history (and a
+    /// provider's prefix cache) stays put until the window overflows again.
+    /// The cut stops at the current turn's user message, which goes only when
+    /// the upstream trim would drop it too. `0`, `1` or a value
+    /// `>= max_history_messages` keeps the upstream behaviour — drop just
+    /// enough to fit, one entry per step (`1` would leave only the system
+    /// prompt after a tool round: the last entry is a `ToolResults`, which goes
+    /// with its dropped call). Applies to `Agent` sessions (`Agent::turn` /
+    /// `turn_streamed`, gateway WebSocket). Default: `0`.
+    #[serde(default)]
+    pub history_trim_keep: usize,
     /// Maximum characters per workspace personality file (`SOUL.md`, `AGENTS.md`,
     /// `TOOLS.md`, …) injected into the system prompt; longer files are cut with a
     /// `[... truncated at N chars …]` marker. Set to `0` to disable truncation.
@@ -1665,6 +1678,7 @@ impl Default for AgentConfig {
             compact_context: true,
             max_tool_iterations: default_agent_max_tool_iterations(),
             max_history_messages: default_agent_max_history_messages(),
+            history_trim_keep: 0,
             workspace_file_max_chars: default_agent_workspace_file_max_chars(),
             max_context_tokens: default_agent_max_context_tokens(),
             parallel_tools: false,
@@ -13019,9 +13033,21 @@ reasoning_effort = "turbo"
         assert!(cfg.compact_context);
         assert_eq!(cfg.max_tool_iterations, 10);
         assert_eq!(cfg.max_history_messages, 50);
+        assert_eq!(cfg.history_trim_keep, 0);
         assert_eq!(cfg.workspace_file_max_chars, 20_000);
         assert!(!cfg.parallel_tools);
         assert_eq!(cfg.tool_dispatcher, "auto");
+    }
+
+    #[test]
+    async fn agent_config_history_trim_keep_parses_and_defaults() {
+        let parsed =
+            parse_test_config("[agent]\nmax_history_messages = 50\nhistory_trim_keep = 30\n");
+        assert_eq!(parsed.agent.max_history_messages, 50);
+        assert_eq!(parsed.agent.history_trim_keep, 30);
+
+        let parsed = parse_test_config("[agent]\nmax_history_messages = 80\n");
+        assert_eq!(parsed.agent.history_trim_keep, 0);
     }
 
     #[test]

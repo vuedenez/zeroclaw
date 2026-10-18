@@ -49,15 +49,21 @@ use zeroclaw_providers::{
 struct ScriptedProvider {
     responses: Mutex<Vec<ChatResponse>>,
     /// Records every request for assertion.
-    requests: Mutex<Vec<Vec<ChatMessage>>>,
+    requests: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
 }
 
 impl ScriptedProvider {
     fn new(responses: Vec<ChatResponse>) -> Self {
         Self {
             responses: Mutex::new(responses),
-            requests: Mutex::new(Vec::new()),
+            requests: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Shared handle to the request log, readable after the provider has
+    /// been moved into an agent.
+    fn request_log(&self) -> Arc<Mutex<Vec<Vec<ChatMessage>>>> {
+        Arc::clone(&self.requests)
     }
 
     #[allow(dead_code)]
@@ -634,6 +640,130 @@ async fn history_trims_after_max_messages() {
     // System prompt should always be preserved
     let first = &agent.history()[0];
     assert!(matches!(first, ConversationMessage::Chat(c) if c.role == "system"));
+}
+
+/// Echo tool call `id` for scripted responses, native or XML-style.
+fn echo_call(id: &str, xml: bool) -> ChatResponse {
+    let args = format!(r#"{{"message": "{id}"}}"#);
+    if xml {
+        return xml_tool_response("echo", &args);
+    }
+    tool_response(vec![ToolCall {
+        id: id.into(),
+        name: "echo".into(),
+        arguments: args,
+        extra_content: None,
+    }])
+}
+
+/// Two turns: a warm-up with 2 echo rounds, then a long turn with `rounds`
+/// echo rounds. Returns, for every provider request of the long turn after
+/// its first, whether it extends the previous request (`true`) or rewrites
+/// something already sent (`false`), and for every request of the long turn
+/// whether it still carries the turn's own request. `streamed` drives
+/// `turn_streamed` — the gateway WebSocket path; the scripted provider has
+/// no stream, so each step falls back to `chat`.
+async fn long_turn_requests(
+    max_history_messages: usize,
+    history_trim_keep: usize,
+    rounds: usize,
+    streamed: bool,
+    xml: bool,
+) -> (Vec<bool>, Vec<bool>) {
+    let mut responses = vec![
+        echo_call("w1", xml),
+        echo_call("w2", xml),
+        text_response("warm"),
+    ];
+    responses.extend((1..=rounds).map(|i| echo_call(&format!("tc{i}"), xml)));
+    responses.push(text_response("done"));
+    let provider = ScriptedProvider::new(responses);
+    let log = provider.request_log();
+    let dispatcher: Box<dyn ToolDispatcher> = if xml {
+        Box::new(XmlToolDispatcher)
+    } else {
+        Box::new(NativeToolDispatcher)
+    };
+    let mut agent = Agent::builder()
+        .provider(Box::new(provider))
+        .tools(vec![Box::new(EchoTool)])
+        .memory(make_memory())
+        .observer(make_observer())
+        .tool_dispatcher(dispatcher)
+        .workspace_dir(std::env::temp_dir())
+        .config(AgentConfig {
+            max_history_messages,
+            history_trim_keep,
+            max_tool_iterations: rounds + 5,
+            ..AgentConfig::default()
+        })
+        .build()
+        .unwrap();
+    for (message, expected) in [("warm up", "warm"), ("long task", "done")] {
+        let answer = if streamed {
+            let (event_tx, _event_rx) = tokio::sync::mpsc::channel(1024);
+            agent.turn_streamed(message, event_tx, None).await
+        } else {
+            agent.turn(message).await
+        };
+        assert_eq!(answer.unwrap(), expected);
+    }
+
+    let requests: Vec<Vec<String>> = log
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|msgs| {
+            msgs.iter()
+                .map(|m| serde_json::to_string(m).unwrap())
+                .collect()
+        })
+        .collect();
+    // 3 warm-up requests, then the long turn's rounds + final answer.
+    assert_eq!(requests.len(), 3 + rounds + 1);
+    let long = &requests[3..];
+    let extends = long
+        .windows(2)
+        .map(|pair| pair[1].starts_with(&pair[0]))
+        .collect();
+    let carries = long
+        .iter()
+        .map(|msgs| msgs.iter().any(|m| m.contains("long task")))
+        .collect();
+    (extends, carries)
+}
+
+/// Orbita patch P6: with `history_trim_keep` the provider requests of one
+/// turn only append, except at the single cut where the window overflowed —
+/// a prefix-caching provider reuses the whole previous request on every
+/// other step — and the cut stops at the turn's own request. Without the key
+/// (upstream) every step after the overflow rewrites the head of the history.
+/// Both dispatchers: the XML one stores tool results as `user` entries, which
+/// must not be mistaken for the request.
+#[tokio::test]
+async fn history_trim_keep_keeps_turn_requests_append_only() {
+    for streamed in [false, true] {
+        for xml in [false, true] {
+            // Window 10: the warm-up leaves 6 entries, the long turn's
+            // requests carry 7, 9, then the 2nd round overflows (11) and the
+            // cut stops at the turn's request (5), then 7, 9.
+            let (extends, carries) = long_turn_requests(10, 4, 4, streamed, xml).await;
+            assert_eq!(
+                extends,
+                vec![true, false, true, true],
+                "streamed={streamed} xml={xml}: expected exactly one rewrite of the request prefix"
+            );
+            assert_eq!(carries, vec![true; 5], "streamed={streamed} xml={xml}");
+
+            let (extends, carries) = long_turn_requests(10, 0, 4, streamed, xml).await;
+            assert_eq!(
+                extends,
+                vec![true, false, false, false],
+                "streamed={streamed} xml={xml}: upstream rewrites the head on every step once full"
+            );
+            assert_eq!(carries, vec![true; 5], "streamed={streamed} xml={xml}");
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
