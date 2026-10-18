@@ -642,27 +642,30 @@ async fn history_trims_after_max_messages() {
     assert!(matches!(first, ConversationMessage::Chat(c) if c.role == "system"));
 }
 
-/// Runs one turn of `rounds` echo tool calls plus a final answer and returns,
-/// for every provider request after the first, whether it extends the
-/// previous request (`true`) or rewrites something already sent (`false`).
-/// `streamed` drives `turn_streamed` — the gateway WebSocket path; the
-/// scripted provider has no stream, so each step falls back to `chat`.
-async fn request_extends_previous(
+/// Echo tool call `id` for scripted responses.
+fn echo_call(id: &str) -> ChatResponse {
+    tool_response(vec![ToolCall {
+        id: id.into(),
+        name: "echo".into(),
+        arguments: format!(r#"{{"message": "{id}"}}"#),
+        extra_content: None,
+    }])
+}
+
+/// Two turns: a warm-up with 2 echo rounds, then a long turn with `rounds`
+/// echo rounds. Returns, for every provider request of the long turn after
+/// its first, whether it extends the previous request (`true`) or rewrites
+/// something already sent (`false`). `streamed` drives `turn_streamed` — the
+/// gateway WebSocket path; the scripted provider has no stream, so each step
+/// falls back to `chat`.
+async fn long_turn_extends_previous(
     max_history_messages: usize,
     history_trim_keep: usize,
     rounds: usize,
     streamed: bool,
 ) -> Vec<bool> {
-    let mut responses: Vec<ChatResponse> = (1..=rounds)
-        .map(|i| {
-            tool_response(vec![ToolCall {
-                id: format!("tc{i}"),
-                name: "echo".into(),
-                arguments: format!(r#"{{"message": "step {i}"}}"#),
-                extra_content: None,
-            }])
-        })
-        .collect();
+    let mut responses = vec![echo_call("w1"), echo_call("w2"), text_response("warm")];
+    responses.extend((1..=rounds).map(|i| echo_call(&format!("tc{i}"))));
     responses.push(text_response("done"));
     let provider = ScriptedProvider::new(responses);
     let log = provider.request_log();
@@ -673,13 +676,15 @@ async fn request_extends_previous(
         ..AgentConfig::default()
     };
     let mut agent = build_agent_with_config(Box::new(provider), vec![Box::new(EchoTool)], config);
-    let answer = if streamed {
-        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(1024);
-        agent.turn_streamed("long task", event_tx, None).await
-    } else {
-        agent.turn("long task").await
-    };
-    assert_eq!(answer.unwrap(), "done");
+    for (message, expected) in [("warm up", "warm"), ("long task", "done")] {
+        let answer = if streamed {
+            let (event_tx, _event_rx) = tokio::sync::mpsc::channel(1024);
+            agent.turn_streamed(message, event_tx, None).await
+        } else {
+            agent.turn(message).await
+        };
+        assert_eq!(answer.unwrap(), expected);
+    }
 
     let requests: Vec<Vec<String>> = log
         .lock()
@@ -691,8 +696,9 @@ async fn request_extends_previous(
                 .collect()
         })
         .collect();
-    assert_eq!(requests.len(), rounds + 1);
-    requests
+    // 3 warm-up requests, then the long turn's rounds + final answer.
+    assert_eq!(requests.len(), 3 + rounds + 1);
+    requests[3..]
         .windows(2)
         .map(|pair| pair[1].starts_with(&pair[0]))
         .collect()
@@ -706,19 +712,20 @@ async fn request_extends_previous(
 #[tokio::test]
 async fn history_trim_keep_keeps_turn_requests_append_only() {
     for streamed in [false, true] {
-        // 8 rounds, window 10: requests carry 1, 3, 5, 7, 9 entries, the 5th
-        // round overflows (11) and cuts to 4, then 6, 8, 10.
-        let extends = request_extends_previous(10, 4, 8, streamed).await;
+        // Window 10: the warm-up leaves 6 entries, the long turn's requests
+        // carry 7, 9, then the 2nd round overflows (11) and the cut stops at
+        // the turn's user message (5), then 7, 9.
+        let extends = long_turn_extends_previous(10, 4, 4, streamed).await;
         assert_eq!(
             extends,
-            vec![true, true, true, true, false, true, true, true],
+            vec![true, false, true, true],
             "streamed={streamed}: expected exactly one rewrite of the request prefix"
         );
 
-        let extends = request_extends_previous(10, 0, 8, streamed).await;
+        let extends = long_turn_extends_previous(10, 0, 4, streamed).await;
         assert_eq!(
             extends,
-            vec![true, true, true, true, false, false, false, false],
+            vec![true, false, false, false],
             "streamed={streamed}: upstream trim rewrites the head on every step once full"
         );
     }

@@ -1549,12 +1549,13 @@ pub struct AgentConfig {
     /// `max_history_messages`: the overflowing trim drops the oldest entries
     /// down to this low-water mark in one go, so the head of the history (and a
     /// provider's prefix cache) stays put until the window overflows again.
-    /// `0`, `1` or a value `>= max_history_messages` keeps the upstream
-    /// behaviour — drop just enough to fit, one entry per step (`1` would leave
-    /// only the system prompt after a tool round: the last entry is a
-    /// `ToolResults`, which goes with its dropped call). Applies to `Agent`
-    /// sessions (`Agent::turn` / `turn_streamed`, gateway WebSocket).
-    /// Default: `0`.
+    /// The cut stops at the current turn's user message, which goes only when
+    /// the upstream trim would drop it too. `0`, `1` or a value
+    /// `>= max_history_messages` keeps the upstream behaviour — drop just
+    /// enough to fit, one entry per step (`1` would leave only the system
+    /// prompt after a tool round: the last entry is a `ToolResults`, which goes
+    /// with its dropped call). Applies to `Agent` sessions (`Agent::turn` /
+    /// `turn_streamed`, gateway WebSocket). Default: `0`.
     #[serde(default)]
     pub history_trim_keep: usize,
     /// Maximum characters per workspace personality file (`SOUL.md`, `AGENTS.md`,
