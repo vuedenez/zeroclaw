@@ -1721,10 +1721,12 @@ pub async fn run(
 }
 
 /// Entries `trim_history` keeps once the history overflows
-/// `max_history_messages`: `history_trim_keep` when it is in `1..max`,
+/// `max_history_messages`: `history_trim_keep` when it is in `2..max`,
 /// otherwise `max` — the upstream trim, which drops just enough to fit.
+/// `1` is refused: after a tool round the last entry is a `ToolResults`, the
+/// orphan guard drops it too, and only the system prompt would remain.
 fn effective_history_trim_keep(max: usize, keep: usize) -> usize {
-    if keep == 0 || keep >= max { max } else { keep }
+    if keep < 2 || keep >= max { max } else { keep }
 }
 
 #[cfg(test)]
@@ -2918,7 +2920,8 @@ mod tests {
         assert_eq!(effective_history_trim_keep(50, 50), 50);
         assert_eq!(effective_history_trim_keep(50, 80), 50);
         assert_eq!(effective_history_trim_keep(50, 30), 30);
-        assert_eq!(effective_history_trim_keep(50, 1), 1);
+        assert_eq!(effective_history_trim_keep(50, 2), 2);
+        assert_eq!(effective_history_trim_keep(50, 1), 50);
         assert_eq!(effective_history_trim_keep(0, 30), 0);
     }
 
@@ -2927,7 +2930,7 @@ mod tests {
     #[test]
     fn history_trim_keep_unset_matches_upstream_trim() {
         let max = 6;
-        for keep in [0, max, max + 3] {
+        for keep in [0, 1, max, max + 3] {
             let mut agent = trim_test_agent(max, keep);
             let mut oracle = agent.history.clone();
             for i in 0..25 {
@@ -2980,10 +2983,18 @@ mod tests {
         assert_eq!(lens, vec![3, 5, 7, 4, 6, 8, 4, 6, 8, 4]);
         assert_eq!(head_changes, vec![4, 7, 10]);
 
+        // The lowest accepted mark still keeps the current call/result pair.
+        let (lens, head_changes) = run_tool_rounds(4, 2, 5);
+        assert_eq!(lens, vec![3, 2, 4, 2, 4]);
+        assert_eq!(head_changes, vec![2, 4]);
+
         // Upstream (key unset): once full, every round moves the head.
         let (lens, head_changes) = run_tool_rounds(8, 0, 10);
         assert_eq!(lens, vec![3, 5, 7, 8, 8, 8, 8, 8, 8, 8]);
         assert_eq!(head_changes, vec![4, 5, 6, 7, 8, 9, 10]);
+
+        // keep = 1 falls back to upstream instead of emptying the history.
+        assert_eq!(run_tool_rounds(8, 1, 10), run_tool_rounds(8, 0, 10));
     }
 
     /// A cut that would leave a `ToolResults` first drops it together with

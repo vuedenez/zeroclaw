@@ -645,10 +645,13 @@ async fn history_trims_after_max_messages() {
 /// Runs one turn of `rounds` echo tool calls plus a final answer and returns,
 /// for every provider request after the first, whether it extends the
 /// previous request (`true`) or rewrites something already sent (`false`).
+/// `streamed` drives `turn_streamed` — the gateway WebSocket path; the
+/// scripted provider has no stream, so each step falls back to `chat`.
 async fn request_extends_previous(
     max_history_messages: usize,
     history_trim_keep: usize,
     rounds: usize,
+    streamed: bool,
 ) -> Vec<bool> {
     let mut responses: Vec<ChatResponse> = (1..=rounds)
         .map(|i| {
@@ -670,7 +673,13 @@ async fn request_extends_previous(
         ..AgentConfig::default()
     };
     let mut agent = build_agent_with_config(Box::new(provider), vec![Box::new(EchoTool)], config);
-    assert_eq!(agent.turn("long task").await.unwrap(), "done");
+    let answer = if streamed {
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(1024);
+        agent.turn_streamed("long task", event_tx, None).await
+    } else {
+        agent.turn("long task").await
+    };
+    assert_eq!(answer.unwrap(), "done");
 
     let requests: Vec<Vec<String>> = log
         .lock()
@@ -696,21 +705,23 @@ async fn request_extends_previous(
 /// rewrites the head of the history.
 #[tokio::test]
 async fn history_trim_keep_keeps_turn_requests_append_only() {
-    // 8 rounds, window 10: requests carry 1, 3, 5, 7, 9 entries, the 5th round
-    // overflows (11) and cuts to 4, then 6, 8, 10.
-    let extends = request_extends_previous(10, 4, 8).await;
-    assert_eq!(
-        extends,
-        vec![true, true, true, true, false, true, true, true],
-        "expected exactly one rewrite of the request prefix"
-    );
+    for streamed in [false, true] {
+        // 8 rounds, window 10: requests carry 1, 3, 5, 7, 9 entries, the 5th
+        // round overflows (11) and cuts to 4, then 6, 8, 10.
+        let extends = request_extends_previous(10, 4, 8, streamed).await;
+        assert_eq!(
+            extends,
+            vec![true, true, true, true, false, true, true, true],
+            "streamed={streamed}: expected exactly one rewrite of the request prefix"
+        );
 
-    let extends = request_extends_previous(10, 0, 8).await;
-    assert_eq!(
-        extends,
-        vec![true, true, true, true, false, false, false, false],
-        "upstream trim rewrites the head on every step once full"
-    );
+        let extends = request_extends_previous(10, 0, 8, streamed).await;
+        assert_eq!(
+            extends,
+            vec![true, true, true, true, false, false, false, false],
+            "streamed={streamed}: upstream trim rewrites the head on every step once full"
+        );
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
