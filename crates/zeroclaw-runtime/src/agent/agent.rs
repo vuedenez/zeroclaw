@@ -754,7 +754,12 @@ impl Agent {
         }
 
         if other_messages.len() > max {
-            let mut drop_count = other_messages.len() - max;
+            // `[agent] history_trim_keep`: cut down to the low-water mark in one
+            // go, so the head of the history stays put until the window
+            // overflows again; `keep == max` is the upstream one-per-step trim.
+            let keep = effective_history_trim_keep(max, self.config.history_trim_keep);
+            let before = other_messages.len();
+            let mut drop_count = before - keep;
 
             // Avoid creating orphan ToolResults: if the first message remaining
             // after the drop is a ToolResults, its paired AssistantToolCalls was
@@ -773,6 +778,16 @@ impl Agent {
             }
 
             other_messages.drain(0..drop_count);
+
+            if keep < max {
+                tracing::info!(
+                    before,
+                    after = other_messages.len(),
+                    max_history_messages = max,
+                    history_trim_keep = keep,
+                    "history trimmed to low-water mark"
+                );
+            }
         }
 
         self.history = system_messages;
@@ -1703,6 +1718,13 @@ pub async fn run(
     });
 
     Ok(())
+}
+
+/// Entries `trim_history` keeps once the history overflows
+/// `max_history_messages`: `history_trim_keep` when it is in `1..max`,
+/// otherwise `max` — the upstream trim, which drops just enough to fit.
+fn effective_history_trim_keep(max: usize, keep: usize) -> usize {
+    if keep == 0 || keep >= max { max } else { keep }
 }
 
 #[cfg(test)]
@@ -2764,6 +2786,224 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── history_trim_keep (Orbita patch P6) ─────────────────────────────
+
+    fn trim_test_agent(max_history_messages: usize, history_trim_keep: usize) -> Agent {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(Box::new(MockProvider {
+                responses: Mutex::new(vec![]),
+            }))
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .config(zeroclaw_config::schema::AgentConfig {
+                max_history_messages,
+                history_trim_keep,
+                ..zeroclaw_config::schema::AgentConfig::default()
+            })
+            .build()
+            .expect("agent builder should succeed with valid config");
+        agent
+            .history
+            .push(ConversationMessage::Chat(ChatMessage::system("sys")));
+        agent
+    }
+
+    fn tool_call_entry(i: usize) -> ConversationMessage {
+        ConversationMessage::AssistantToolCalls {
+            text: None,
+            tool_calls: vec![zeroclaw_providers::ToolCall {
+                id: format!("tc{i}"),
+                name: "mock".into(),
+                arguments: "{}".into(),
+                extra_content: None,
+            }],
+            reasoning_content: None,
+        }
+    }
+
+    fn tool_result_entry(i: usize) -> ConversationMessage {
+        ConversationMessage::ToolResults(vec![zeroclaw_providers::ToolResultMessage {
+            tool_call_id: format!("tc{i}"),
+            content: format!("result{i}"),
+        }])
+    }
+
+    /// Entry `i` of a long turn: user message, then call/result pairs.
+    fn turn_entry(i: usize) -> ConversationMessage {
+        match i {
+            0 => ConversationMessage::Chat(ChatMessage::user("start")),
+            i if i % 2 == 1 => tool_call_entry(i.div_ceil(2)),
+            i => tool_result_entry(i / 2),
+        }
+    }
+
+    fn history_json(agent: &Agent) -> Vec<String> {
+        agent
+            .history
+            .iter()
+            .map(|m| serde_json::to_string(m).expect("history entry serializes"))
+            .collect()
+    }
+
+    fn assert_system_first_and_pairs_intact(agent: &Agent) {
+        assert!(
+            matches!(&agent.history[0], ConversationMessage::Chat(c) if c.role == "system"),
+            "system prompt must stay at index 0"
+        );
+        assert!(
+            !matches!(
+                agent.history.get(1),
+                Some(ConversationMessage::ToolResults(_))
+            ),
+            "history must not start with an orphan ToolResults"
+        );
+        for window in agent.history.windows(2) {
+            if let ConversationMessage::ToolResults(results) = &window[1] {
+                let ConversationMessage::AssistantToolCalls { tool_calls, .. } = &window[0] else {
+                    panic!("ToolResults is not preceded by its AssistantToolCalls");
+                };
+                assert_eq!(tool_calls[0].id, results[0].tool_call_id);
+            }
+        }
+    }
+
+    /// Upstream v0.7.5 `trim_history`, verbatim, as the oracle for "key unset".
+    fn upstream_trim(history: &mut Vec<ConversationMessage>, max: usize) {
+        if history.len() <= max {
+            return;
+        }
+        let mut system_messages = Vec::new();
+        let mut other_messages = Vec::new();
+        for msg in history.drain(..) {
+            match &msg {
+                ConversationMessage::Chat(chat) if chat.role == "system" => {
+                    system_messages.push(msg);
+                }
+                _ => other_messages.push(msg),
+            }
+        }
+        if other_messages.len() > max {
+            let mut drop_count = other_messages.len() - max;
+            while drop_count < other_messages.len()
+                && matches!(
+                    &other_messages[drop_count],
+                    ConversationMessage::ToolResults(_)
+                )
+            {
+                drop_count += 1;
+            }
+            other_messages.drain(0..drop_count);
+        }
+        *history = system_messages;
+        history.extend(other_messages);
+    }
+
+    #[test]
+    fn effective_history_trim_keep_falls_back_to_max() {
+        assert_eq!(effective_history_trim_keep(50, 0), 50);
+        assert_eq!(effective_history_trim_keep(50, 50), 50);
+        assert_eq!(effective_history_trim_keep(50, 80), 50);
+        assert_eq!(effective_history_trim_keep(50, 30), 30);
+        assert_eq!(effective_history_trim_keep(50, 1), 1);
+        assert_eq!(effective_history_trim_keep(0, 30), 0);
+    }
+
+    /// Key unset (0), equal to the window or larger: every step is
+    /// byte-identical to upstream, including the orphan-`ToolResults` guard.
+    #[test]
+    fn history_trim_keep_unset_matches_upstream_trim() {
+        let max = 6;
+        for keep in [0, max, max + 3] {
+            let mut agent = trim_test_agent(max, keep);
+            let mut oracle = agent.history.clone();
+            for i in 0..25 {
+                agent.history.push(turn_entry(i));
+                oracle.push(turn_entry(i));
+                agent.trim_history();
+                upstream_trim(&mut oracle, max);
+                let oracle_json: Vec<String> = oracle
+                    .iter()
+                    .map(|m| serde_json::to_string(m).unwrap())
+                    .collect();
+                assert_eq!(
+                    history_json(&agent),
+                    oracle_json,
+                    "keep={keep}, step {i}: history differs from upstream trim"
+                );
+            }
+        }
+    }
+
+    /// Rounds of one long turn as `Agent::turn` runs them: the user message,
+    /// then per tool round a call/result pair followed by `trim_history`.
+    /// Returns the entry count after each round and the rounds after which
+    /// the history no longer starts with the previous one (head changed).
+    fn run_tool_rounds(max: usize, keep: usize, rounds: usize) -> (Vec<usize>, Vec<usize>) {
+        let mut agent = trim_test_agent(max, keep);
+        agent
+            .history
+            .push(ConversationMessage::Chat(ChatMessage::user("start")));
+        let (mut lens, mut head_changes) = (Vec::new(), Vec::new());
+        for round in 1..=rounds {
+            let prev = history_json(&agent);
+            agent.history.push(tool_call_entry(round));
+            agent.history.push(tool_result_entry(round));
+            agent.trim_history();
+            assert_system_first_and_pairs_intact(&agent);
+            if !history_json(&agent).starts_with(&prev) {
+                head_changes.push(round);
+            }
+            lens.push(agent.history.len() - 1);
+        }
+        (lens, head_changes)
+    }
+
+    /// Key set: the overflow cuts down to `history_trim_keep` once; the
+    /// following rounds only append until the window overflows again.
+    #[test]
+    fn history_trim_keep_cuts_to_low_water_mark_once() {
+        let (lens, head_changes) = run_tool_rounds(8, 4, 10);
+        assert_eq!(lens, vec![3, 5, 7, 4, 6, 8, 4, 6, 8, 4]);
+        assert_eq!(head_changes, vec![4, 7, 10]);
+
+        // Upstream (key unset): once full, every round moves the head.
+        let (lens, head_changes) = run_tool_rounds(8, 0, 10);
+        assert_eq!(lens, vec![3, 5, 7, 8, 8, 8, 8, 8, 8, 8]);
+        assert_eq!(head_changes, vec![4, 5, 6, 7, 8, 9, 10]);
+    }
+
+    /// A cut that would leave a `ToolResults` first drops it together with
+    /// its pair, so the history may end up one entry below the mark.
+    #[test]
+    fn history_trim_keep_does_not_leave_orphan_tool_results() {
+        let (max, keep) = (6, 3);
+        let mut agent = trim_test_agent(max, keep);
+        // U, AC1, TR1, AC2, TR2, AC3, TR3 — 7 entries; dropping 4 would leave
+        // TR2 first, so it goes too.
+        for i in 0..7 {
+            agent.history.push(turn_entry(i));
+        }
+        agent.trim_history();
+        assert_system_first_and_pairs_intact(&agent);
+        assert_eq!(agent.history.len() - 1, 2);
+        assert!(matches!(
+            &agent.history[1],
+            ConversationMessage::AssistantToolCalls { tool_calls, .. } if tool_calls[0].id == "tc3"
+        ));
     }
 
     // ── Duplicate narration guard ────────────────────────────────────

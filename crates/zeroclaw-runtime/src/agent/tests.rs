@@ -49,15 +49,21 @@ use zeroclaw_providers::{
 struct ScriptedProvider {
     responses: Mutex<Vec<ChatResponse>>,
     /// Records every request for assertion.
-    requests: Mutex<Vec<Vec<ChatMessage>>>,
+    requests: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
 }
 
 impl ScriptedProvider {
     fn new(responses: Vec<ChatResponse>) -> Self {
         Self {
             responses: Mutex::new(responses),
-            requests: Mutex::new(Vec::new()),
+            requests: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Shared handle to the request log, readable after the provider has
+    /// been moved into an agent.
+    fn request_log(&self) -> Arc<Mutex<Vec<Vec<ChatMessage>>>> {
+        Arc::clone(&self.requests)
     }
 
     #[allow(dead_code)]
@@ -634,6 +640,77 @@ async fn history_trims_after_max_messages() {
     // System prompt should always be preserved
     let first = &agent.history()[0];
     assert!(matches!(first, ConversationMessage::Chat(c) if c.role == "system"));
+}
+
+/// Runs one turn of `rounds` echo tool calls plus a final answer and returns,
+/// for every provider request after the first, whether it extends the
+/// previous request (`true`) or rewrites something already sent (`false`).
+async fn request_extends_previous(
+    max_history_messages: usize,
+    history_trim_keep: usize,
+    rounds: usize,
+) -> Vec<bool> {
+    let mut responses: Vec<ChatResponse> = (1..=rounds)
+        .map(|i| {
+            tool_response(vec![ToolCall {
+                id: format!("tc{i}"),
+                name: "echo".into(),
+                arguments: format!(r#"{{"message": "step {i}"}}"#),
+                extra_content: None,
+            }])
+        })
+        .collect();
+    responses.push(text_response("done"));
+    let provider = ScriptedProvider::new(responses);
+    let log = provider.request_log();
+    let config = AgentConfig {
+        max_history_messages,
+        history_trim_keep,
+        max_tool_iterations: rounds + 5,
+        ..AgentConfig::default()
+    };
+    let mut agent = build_agent_with_config(Box::new(provider), vec![Box::new(EchoTool)], config);
+    assert_eq!(agent.turn("long task").await.unwrap(), "done");
+
+    let requests: Vec<Vec<String>> = log
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|msgs| {
+            msgs.iter()
+                .map(|m| serde_json::to_string(m).unwrap())
+                .collect()
+        })
+        .collect();
+    assert_eq!(requests.len(), rounds + 1);
+    requests
+        .windows(2)
+        .map(|pair| pair[1].starts_with(&pair[0]))
+        .collect()
+}
+
+/// Orbita patch P6: with `history_trim_keep` the provider requests of one
+/// turn only append, except at the single cut where the window overflowed —
+/// a prefix-caching provider reuses the whole previous request on every
+/// other step. Without the key (upstream) every step after the overflow
+/// rewrites the head of the history.
+#[tokio::test]
+async fn history_trim_keep_keeps_turn_requests_append_only() {
+    // 8 rounds, window 10: requests carry 1, 3, 5, 7, 9 entries, the 5th round
+    // overflows (11) and cuts to 4, then 6, 8, 10.
+    let extends = request_extends_previous(10, 4, 8).await;
+    assert_eq!(
+        extends,
+        vec![true, true, true, true, false, true, true, true],
+        "expected exactly one rewrite of the request prefix"
+    );
+
+    let extends = request_extends_previous(10, 0, 8).await;
+    assert_eq!(
+        extends,
+        vec![true, true, true, true, false, false, false, false],
+        "upstream trim rewrites the head on every step once full"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
