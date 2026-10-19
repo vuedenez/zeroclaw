@@ -11,7 +11,7 @@
 //!   6. Tool execution failure recovery
 //!   7. Parallel tool dispatch
 //!   8. History trimming during long conversations
-//!   9. Memory auto-save round-trip
+//!   9. Memory auto-save round-trip (and the Orbita P5 turn-recall keys)
 //!  10. Native vs XML dispatcher integration
 //!  11. Empty / whitespace-only LLM responses
 //!  12. Mixed text + tool call responses
@@ -824,6 +824,296 @@ async fn auto_save_disabled_does_not_store() {
 
     let count = mem.count().await.unwrap();
     assert_eq!(count, 0, "Expected 0 memory entries with auto_save off");
+}
+
+/// Memory wrapper that records every `recall` / `store` together with the
+/// number of provider requests made before it — `0` means the call ran
+/// before the first model request. `recall_hits`, when set, answers recall
+/// instead of the inner backend.
+struct RecordingMemory {
+    inner: Arc<dyn Memory>,
+    provider_requests: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+    events: Arc<Mutex<Vec<(String, usize)>>>,
+    recall_hits: Vec<zeroclaw_memory::MemoryEntry>,
+}
+
+impl RecordingMemory {
+    fn record(&self, event: String) {
+        let before = self.provider_requests.lock().unwrap().len();
+        self.events.lock().unwrap().push((event, before));
+    }
+}
+
+#[async_trait]
+impl Memory for RecordingMemory {
+    fn name(&self) -> &str {
+        "recording"
+    }
+
+    async fn store(
+        &self,
+        key: &str,
+        content: &str,
+        category: zeroclaw_memory::MemoryCategory,
+        session_id: Option<&str>,
+    ) -> Result<()> {
+        self.record(format!("store:{key}"));
+        self.inner.store(key, content, category, session_id).await
+    }
+
+    async fn recall(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> Result<Vec<zeroclaw_memory::MemoryEntry>> {
+        self.record("recall".into());
+        if !self.recall_hits.is_empty() {
+            return Ok(self.recall_hits.clone());
+        }
+        self.inner
+            .recall(query, limit, session_id, since, until)
+            .await
+    }
+
+    async fn get(&self, key: &str) -> Result<Option<zeroclaw_memory::MemoryEntry>> {
+        self.inner.get(key).await
+    }
+
+    async fn list(
+        &self,
+        category: Option<&zeroclaw_memory::MemoryCategory>,
+        session_id: Option<&str>,
+    ) -> Result<Vec<zeroclaw_memory::MemoryEntry>> {
+        self.inner.list(category, session_id).await
+    }
+
+    async fn forget(&self, key: &str) -> Result<bool> {
+        self.inner.forget(key).await
+    }
+
+    async fn count(&self) -> Result<usize> {
+        self.inner.count().await
+    }
+
+    async fn health_check(&self) -> bool {
+        self.inner.health_check().await
+    }
+}
+
+/// What one turn did with memory under the Orbita patch P5 keys.
+struct TurnMemoryRun {
+    /// `recall` / `store:<key>` calls with the provider requests made before each.
+    events: Vec<(String, usize)>,
+    /// The user message of the first provider request.
+    first_request_user: String,
+    /// The backend behind the recording wrapper.
+    memory: Arc<dyn Memory>,
+    _tmp: tempfile::TempDir,
+}
+
+/// One turn (`turn`, or `turn_streamed` — the gateway WebSocket path) with
+/// `auto_save` on and the P5 keys `(turn_recall, autosave_user_message)`;
+/// `None` leaves both unset, as `Agent::from_config` without the keys would
+/// not — the builder default must match upstream on its own.
+async fn turn_memory_run(
+    keys: Option<(bool, bool)>,
+    streamed: bool,
+    recall_hits: Vec<zeroclaw_memory::MemoryEntry>,
+) -> TurnMemoryRun {
+    let (inner, tmp) = make_sqlite_memory();
+    let provider = ScriptedProvider::new(vec![text_response("ok")]);
+    let requests = provider.request_log();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let memory: Arc<dyn Memory> = Arc::new(RecordingMemory {
+        inner: inner.clone(),
+        provider_requests: Arc::clone(&requests),
+        events: Arc::clone(&events),
+        recall_hits,
+    });
+    let mut builder = Agent::builder()
+        .provider(Box::new(provider))
+        .tools(vec![])
+        .memory(memory)
+        .observer(make_observer())
+        .tool_dispatcher(Box::new(NativeToolDispatcher))
+        .workspace_dir(std::env::temp_dir())
+        .auto_save(true)
+        .memory_session_id(Some("gw_session".into()));
+    if let Some((turn_recall, autosave_user_message)) = keys {
+        builder = builder
+            .turn_recall(turn_recall)
+            .autosave_user_message(autosave_user_message);
+    }
+    let mut agent = builder.build().unwrap();
+
+    let answer = if streamed {
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
+        agent.turn_streamed("tea or coffee?", event_tx, None).await
+    } else {
+        agent.turn("tea or coffee?").await
+    };
+    assert_eq!(answer.unwrap(), "ok");
+
+    let first_request_user = requests.lock().unwrap()[0]
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map(|m| m.content.clone())
+        .unwrap();
+    let events = events.lock().unwrap().clone();
+    TurnMemoryRun {
+        events,
+        first_request_user,
+        memory: inner,
+        _tmp: tmp,
+    }
+}
+
+fn recall_event() -> (String, usize) {
+    ("recall".to_string(), 0)
+}
+
+fn user_msg_store_event() -> (String, usize) {
+    ("store:user_msg".to_string(), 0)
+}
+
+/// Orbita patch P5: `[memory] turn_recall` and `autosave_user_message`
+/// decide whether a turn recalls for the `[Memory context]` block and stores
+/// the `user_msg` entry — both before the first model request, the only
+/// memory work on the critical path of a turn. Unset (upstream) and `true`
+/// keep both; each key drops only its own call.
+#[tokio::test]
+async fn turn_recall_keys_gate_memory_work_before_the_model() {
+    for streamed in [false, true] {
+        for keys in [None, Some((true, true))] {
+            let run = turn_memory_run(keys, streamed, vec![]).await;
+            assert_eq!(
+                run.events,
+                vec![recall_event(), user_msg_store_event()],
+                "streamed={streamed} keys={keys:?}"
+            );
+            assert!(run.memory.get("user_msg").await.unwrap().is_some());
+        }
+
+        let run = turn_memory_run(Some((false, false)), streamed, vec![]).await;
+        assert!(
+            run.events.is_empty(),
+            "streamed={streamed}: no memory call during the turn, got {:?}",
+            run.events
+        );
+        assert_eq!(run.memory.count().await.unwrap(), 0);
+
+        let run = turn_memory_run(Some((false, true)), streamed, vec![]).await;
+        assert_eq!(
+            run.events,
+            vec![user_msg_store_event()],
+            "streamed={streamed}"
+        );
+
+        let run = turn_memory_run(Some((true, false)), streamed, vec![]).await;
+        assert_eq!(run.events, vec![recall_event()], "streamed={streamed}");
+        assert!(run.memory.get("user_msg").await.unwrap().is_none());
+    }
+}
+
+/// With `turn_recall = false` the `[Memory context]` block is not built even
+/// when recall would have found entries; with the key unset it is, as
+/// upstream.
+#[tokio::test]
+async fn turn_recall_off_leaves_memory_context_out_of_the_request() {
+    let hit = zeroclaw_memory::MemoryEntry {
+        id: "1".into(),
+        key: "drink".into(),
+        content: "prefers green tea".into(),
+        category: zeroclaw_memory::MemoryCategory::Conversation,
+        timestamp: "now".into(),
+        session_id: Some("gw_session".into()),
+        score: Some(0.95),
+        namespace: "default".into(),
+        importance: None,
+        superseded_by: None,
+    };
+    for streamed in [false, true] {
+        let run = turn_memory_run(None, streamed, vec![hit.clone()]).await;
+        assert!(
+            run.first_request_user
+                .contains("[Memory context]\n- drink: prefers green tea\n"),
+            "streamed={streamed}: {}",
+            run.first_request_user
+        );
+
+        let run = turn_memory_run(Some((false, false)), streamed, vec![hit.clone()]).await;
+        assert!(
+            !run.first_request_user.contains("[Memory context]"),
+            "streamed={streamed}: {}",
+            run.first_request_user
+        );
+        assert!(run.first_request_user.ends_with("tea or coffee?"));
+    }
+}
+
+/// Provider for the post-turn consolidation call (`chat_with_system`).
+struct ConsolidationProvider;
+
+#[async_trait]
+impl Provider for ConsolidationProvider {
+    async fn chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: Option<f64>,
+    ) -> Result<String> {
+        Ok(r#"{"history_entry": "asked tea or coffee", "memory_update": "prefers tea"}"#.into())
+    }
+
+    async fn chat(
+        &self,
+        _request: ChatRequest<'_>,
+        _model: &str,
+        _temperature: Option<f64>,
+    ) -> Result<ChatResponse> {
+        Ok(text_response("unused"))
+    }
+}
+
+/// The P5 keys leave post-turn consolidation alone: it runs under
+/// `auto_save` (gateway `ws.rs`) on the turn's text, not on the `user_msg`
+/// entry, so a turn without that entry still yields its `daily` and `core`
+/// rows.
+#[tokio::test]
+async fn consolidation_after_turn_does_not_need_the_user_msg_entry() {
+    let run = turn_memory_run(Some((false, false)), true, vec![]).await;
+    assert!(run.events.is_empty());
+
+    zeroclaw_memory::consolidation::consolidate_turn(
+        &ConsolidationProvider,
+        "test-model",
+        run.memory.as_ref(),
+        "tea or coffee?",
+        "ok",
+    )
+    .await
+    .unwrap();
+
+    let daily = run
+        .memory
+        .list(Some(&zeroclaw_memory::MemoryCategory::Daily), None)
+        .await
+        .unwrap();
+    assert_eq!(daily.len(), 1);
+    assert_eq!(daily[0].content, "asked tea or coffee");
+    let core = run
+        .memory
+        .list(Some(&zeroclaw_memory::MemoryCategory::Core), None)
+        .await
+        .unwrap();
+    assert_eq!(core.len(), 1);
+    assert_eq!(core[0].content, "prefers tea");
+    assert!(run.memory.get("user_msg").await.unwrap().is_none());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

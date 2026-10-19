@@ -40,6 +40,12 @@ pub struct Agent {
     skills: Vec<crate::skills::Skill>,
     skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
     auto_save: bool,
+    /// `[memory] turn_recall` — recall for the `[Memory context]` block at
+    /// the start of a turn (Orbita patch P5).
+    turn_recall: bool,
+    /// `[memory] autosave_user_message` — the `user_msg` store at the start
+    /// of a turn, on top of `auto_save` (Orbita patch P5).
+    autosave_user_message: bool,
     memory_session_id: Option<String>,
     history: Vec<ConversationMessage>,
     /// The current turn's user entry exactly as pushed into `history` — the
@@ -143,6 +149,8 @@ pub struct AgentBuilder {
     skills: Option<Vec<crate::skills::Skill>>,
     skills_prompt_mode: Option<zeroclaw_config::schema::SkillsPromptInjectionMode>,
     auto_save: Option<bool>,
+    turn_recall: Option<bool>,
+    autosave_user_message: Option<bool>,
     memory_session_id: Option<String>,
     classification_config: Option<zeroclaw_config::schema::QueryClassificationConfig>,
     available_hints: Option<Vec<String>>,
@@ -180,6 +188,8 @@ impl AgentBuilder {
             skills: None,
             skills_prompt_mode: None,
             auto_save: None,
+            turn_recall: None,
+            autosave_user_message: None,
             memory_session_id: None,
             classification_config: None,
             available_hints: None,
@@ -272,6 +282,16 @@ impl AgentBuilder {
 
     pub fn auto_save(mut self, auto_save: bool) -> Self {
         self.auto_save = Some(auto_save);
+        self
+    }
+
+    pub fn turn_recall(mut self, turn_recall: bool) -> Self {
+        self.turn_recall = Some(turn_recall);
+        self
+    }
+
+    pub fn autosave_user_message(mut self, autosave_user_message: bool) -> Self {
+        self.autosave_user_message = Some(autosave_user_message);
         self
     }
 
@@ -385,6 +405,8 @@ impl AgentBuilder {
             skills: self.skills.unwrap_or_default(),
             skills_prompt_mode: self.skills_prompt_mode.unwrap_or_default(),
             auto_save: self.auto_save.unwrap_or(false),
+            turn_recall: self.turn_recall.unwrap_or(true),
+            autosave_user_message: self.autosave_user_message.unwrap_or(true),
             memory_session_id: self.memory_session_id,
             history: Vec::new(),
             turn_request: None,
@@ -709,6 +731,8 @@ impl Agent {
             .skills(skills)
             .skills_prompt_mode(config.skills.prompt_injection_mode)
             .auto_save(config.memory.auto_save)
+            .turn_recall(config.memory.turn_recall)
+            .autosave_user_message(config.memory.autosave_user_message)
             .security_summary(Some(security.prompt_summary()))
             .autonomy_level(config.autonomy.level)
             .activated_tools(activated_tools)
@@ -1103,17 +1127,20 @@ impl Agent {
                 )));
         }
 
-        let context = self
-            .memory_loader
-            .load_context(
-                self.memory.as_ref(),
-                user_message,
-                self.memory_session_id.as_deref(),
-            )
-            .await
-            .unwrap_or_default();
+        let context = if self.turn_recall {
+            self.memory_loader
+                .load_context(
+                    self.memory.as_ref(),
+                    user_message,
+                    self.memory_session_id.as_deref(),
+                )
+                .await
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
 
-        if self.auto_save {
+        if self.auto_save && self.autosave_user_message {
             let _ = self
                 .memory
                 .store(
@@ -1281,17 +1308,20 @@ impl Agent {
                 )));
         }
 
-        let context = self
-            .memory_loader
-            .load_context(
-                self.memory.as_ref(),
-                user_message,
-                self.memory_session_id.as_deref(),
-            )
-            .await
-            .unwrap_or_default();
+        let context = if self.turn_recall {
+            self.memory_loader
+                .load_context(
+                    self.memory.as_ref(),
+                    user_message,
+                    self.memory_session_id.as_deref(),
+                )
+                .await
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
 
-        if self.auto_save {
+        if self.auto_save && self.autosave_user_message {
             let _ = self
                 .memory
                 .store(
@@ -2169,6 +2199,48 @@ mod tests {
         assert_eq!(response, "classified");
         let seen = seen_models.lock();
         assert_eq!(seen.as_slice(), &["hint:fast".to_string()]);
+    }
+
+    /// Orbita patch P5: `Agent::from_config` takes both turn keys from
+    /// `[memory]`; absent from the config they stay on, as upstream.
+    #[tokio::test]
+    async fn from_config_wires_turn_recall_keys() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().expect("temp dir");
+        let workspace_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            workspace_dir,
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.providers.fallback = Some("custom:http://127.0.0.1:9".to_string());
+        {
+            let entry = config.ensure_fallback_provider();
+            entry.api_key = Some("test-key".to_string());
+            entry.model = Some("test-model".to_string());
+        }
+        config.memory.backend = "none".to_string();
+
+        let agent = Agent::from_config(&config)
+            .await
+            .expect("agent from config");
+        assert!(agent.auto_save);
+        assert!(agent.turn_recall);
+        assert!(agent.autosave_user_message);
+
+        config.memory.turn_recall = false;
+        config.memory.autosave_user_message = false;
+        let agent = Agent::from_config(&config)
+            .await
+            .expect("agent from config");
+        assert!(
+            agent.auto_save,
+            "auto_save (consolidation) stays as configured"
+        );
+        assert!(!agent.turn_recall);
+        assert!(!agent.autosave_user_message);
     }
 
     #[tokio::test]
