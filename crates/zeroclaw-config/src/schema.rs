@@ -5421,6 +5421,22 @@ pub struct MemoryConfig {
     pub backend: String,
     /// Auto-save what *you* tell ZeroClaw into memory as conversation history — the agent's own replies are not saved. Turn off if you want memory to only hold things you explicitly record via the memory tool.
     pub auto_save: bool,
+    /// Before each `Agent` turn (`Agent::turn` / `turn_streamed`, gateway
+    /// WebSocket), recall up to five memories matching the incoming message for
+    /// the `[Memory context]` block. The recall embeds the whole message, so
+    /// with an embedding provider it costs one embedding request before the
+    /// first model request. Turn off when something else supplies long-term
+    /// memory to the prompt. Default: `true`.
+    #[serde(default = "default_true")]
+    pub turn_recall: bool,
+    /// Store the incoming message as the `user_msg` conversation entry at the
+    /// start of each `Agent` turn (only when `auto_save` is on). The store
+    /// reuses the embedding of the turn recall from the embedding cache; with
+    /// `turn_recall` off it computes the embedding itself, so turn both off to
+    /// drop the embedding request before the first model request. Post-turn
+    /// memory consolidation stays under `auto_save`. Default: `true`.
+    #[serde(default = "default_true")]
+    pub autosave_user_message: bool,
     /// Run the periodic hygiene pass that archives stale daily/session files and enforces retention windows. Leave on unless you want to manage cleanup yourself.
     #[serde(default = "default_hygiene_enabled")]
     pub hygiene_enabled: bool,
@@ -5641,6 +5657,8 @@ impl Default for MemoryConfig {
         Self {
             backend: "sqlite".into(),
             auto_save: true,
+            turn_recall: true,
+            autosave_user_message: true,
             hygiene_enabled: default_hygiene_enabled(),
             archive_after_days: default_archive_after_days(),
             purge_after_days: default_purge_after_days(),
@@ -12312,12 +12330,41 @@ default_temperature = 0.7
         let m = MemoryConfig::default();
         assert_eq!(m.backend, "sqlite");
         assert!(m.auto_save);
+        assert!(m.turn_recall);
+        assert!(m.autosave_user_message);
         assert!(m.hygiene_enabled);
         assert_eq!(m.archive_after_days, 7);
         assert_eq!(m.purge_after_days, 30);
         assert_eq!(m.conversation_retention_days, 30);
         assert!(m.sqlite_open_timeout_secs.is_none());
         assert_eq!(m.search_mode, SearchMode::Hybrid);
+    }
+
+    #[test]
+    async fn memory_config_turn_recall_keys_parse_and_default() {
+        let base = r#"
+workspace_dir = "/tmp/workspace"
+config_path = "/tmp/config.toml"
+default_temperature = 0.7
+
+[memory]
+backend = "sqlite"
+auto_save = true
+"#;
+        let parsed = parse_test_config(base);
+        assert!(parsed.memory.turn_recall);
+        assert!(parsed.memory.autosave_user_message);
+
+        let parsed = parse_test_config(&format!(
+            "{base}turn_recall = false\nautosave_user_message = false\n"
+        ));
+        assert!(!parsed.memory.turn_recall);
+        assert!(!parsed.memory.autosave_user_message);
+        assert!(parsed.memory.auto_save);
+
+        let parsed = parse_test_config(&format!("{base}turn_recall = false\n"));
+        assert!(!parsed.memory.turn_recall);
+        assert!(parsed.memory.autosave_user_message);
     }
 
     #[test]
